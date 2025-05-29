@@ -11,7 +11,7 @@ constexpr int LED_PIN = 21;
 constexpr int SYNC_SERVER_CLIENT_SELECT_PIN = 5;  // high = server, low = client
 constexpr int PWM_PINS[4] = { 0, 1, 4, 3 };
 
-constexpr int TARGET_DRIVE_FREQUENCY = 128;  // 250 Hz according to Pfeifer et al. 2021
+constexpr int TARGET_DRIVE_FREQUENCY = 250;  // 250 Hz according to Pfeifer et al. 2021
 
 // The chip expects a PWM signal where duty cycle 50 means stopped, and 255 is full speed in one phase, 0 full speed in the opposite phase.
 // Though for signal reasons we can't actually use 0% and 100%.
