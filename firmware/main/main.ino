@@ -203,17 +203,16 @@ void setup() {
     advertising = BLEDevice::getAdvertising();
     advertising->addServiceUUID(SERVICE_UUID);
     advertising->setScanResponse(true);
-    advertising->setMinPreferred(0x06);
-    advertising->setMaxPreferred(12);
+    advertising->setMinPreferred(0x06);  // This is apparently required for iPhones? Do we care?
+    advertising->setMaxPreferred(0x12);
     advertising->start();
   } else {
     Serial.println("Starting as BLE client");
     BLEDevice::init("Vibrating Glove (Client)");
     scan = BLEDevice::getScan();
-    //scan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
     scan->setActiveScan(true);
-    scan->setInterval(100);
-    scan->setWindow(99);
+    scan->setInterval(0x10);  // 10ms.
+    scan->setWindow(0x10);  // 10ms.
     client = BLEDevice::createClient();
   }
 
