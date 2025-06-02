@@ -171,7 +171,7 @@ static void ClientNotifyCallback(
 }
 
 void setup() {
-  Serial.begin();
+  Serial.begin(115200);
   delay(500);
   pinMode(LED_PIN, OUTPUT);
   pinMode(DRV_EN_PIN, OUTPUT);
@@ -231,107 +231,104 @@ void Shutdown(bool with_flashing_leds = true) {
     }
   } else {
     delay(100);  // Wait for any potentially in-flight I2C transmissions to finish.
-  }
-  
+  } 
   // Go into permanent deep sleep, which is the lowest power state we can access from
   // firmware.
   esp_deep_sleep_start();
 }
 
-int low_battery_iterations = 0;
-
-void loop() {
+bool BatteryOK() {
+  static int low_battery_iterations = 0;
   float vbatt = ReadVBatt();
-  if (vbatt < LOW_BATT_THRESHOLD) {
-    ++low_battery_iterations;
-    if (low_battery_iterations > 3) {
-      Serial.printf("Low battery: %fV. Shutting down", vbatt);
-      Shutdown();
-    }
-  } else {
+  if (vbatt >= LOW_BATT_THRESHOLD) { 
     low_battery_iterations = 0;
+    return false;
   }
+  return ++low_battery_iterations > 3;
+}
 
-  if (millis() > (TOTAL_RUN_TIME_S * 1000)) {
-    Serial.println("We are done! Shutting down now");
-    Shutdown(false);
+void ServerLoop() {
+  if (device_connected && !last_device_connected) {
+    // We have a new connection, and can stop advertising.
+    advertising->stop();
   }
+  if (!device_connected && last_device_connected) {
+    // Client has disconnected. Start advertising again.
+    advertising->start();
+  }
+  if (device_connected) {
+    characteristic->setValue(rng_state);
+    characteristic->notify();
+  }
+  last_device_connected = device_connected;
+}
 
-  if (is_ble_server) {
-    if (device_connected && !last_device_connected) {
-      // We have a new connection, and can stop advertising.
-      advertising->stop();
-    }
-    if (!device_connected && last_device_connected) {
-      // Client has disconnected. Start advertising again.
-      advertising->start();
-    }
-    if (device_connected) {
-      characteristic->setValue(rng_state);
-      characteristic->notify();
-    }
-    last_device_connected = device_connected;
-  } else {
-    if (!connected_to_server) {
-      BLEScanResults* found_devices = scan->start(BLE_SCAN_TIME_S, false);
-      Serial.print("Devices found: ");
-      Serial.println(found_devices->getCount());
-      for (int dev_id = 0; dev_id < found_devices->getCount(); ++dev_id) {
-        auto remote_device = found_devices->getDevice(dev_id);
-        BLEUUID service_uuid = remote_device.getServiceUUID();
-        if (service_uuid.equals(BLEUUID(SERVICE_UUID))) {
-          Serial.println("Found our device! Connecting");
-          client->setClientCallbacks(new MyClientCallback());
-          client->connect(&remote_device);
-          BLERemoteService* remote_service = client->getService(SERVICE_UUID);
-          if (remote_service == nullptr) {
-            Serial.println("We don't have the right service?");
-            client->disconnect();
-            break;
-          }
-          BLERemoteCharacteristic* remote_characteristic = remote_service->getCharacteristic(CHARACTERISTIC_UUID);
-          if (remote_characteristic == nullptr) {
-            Serial.println("We don't have the right characteristic?");
-            client->disconnect();
-            break;
-          }
-          if (!remote_characteristic->canRead() || !remote_characteristic->canNotify()) {
-            Serial.println("Wrong characteristic capabilities set on server");
-            client->disconnect();
-            break;
-          }
-          remote_characteristic->registerForNotify(ClientNotifyCallback);
-          connected_to_server = true;
-          Serial.printf("We are connected! Current seed: %u\n", remote_characteristic->readUInt32());
-        }
+bool EnsureConnectionToServer() {
+  if (last_device_connected) return true;
+
+  // The code below looks like it would leak memory like crazy...
+  BLEScanResults* found_devices = scan->start(BLE_SCAN_TIME_S, false);
+  Serial.print("Devices found: ");
+  Serial.println(found_devices->getCount());
+  for (int dev_id = 0; dev_id < found_devices->getCount(); ++dev_id) {
+    auto remote_device = found_devices->getDevice(dev_id);
+    BLEUUID service_uuid = remote_device.getServiceUUID();
+    if (service_uuid.equals(BLEUUID(SERVICE_UUID))) {
+      Serial.println("Found a device! Validating...");
+      client->setClientCallbacks(new MyClientCallback());
+      client->connect(&remote_device);
+      BLERemoteService* remote_service = client->getService(SERVICE_UUID); //do we ever need to free this?
+      if (remote_service == nullptr) {
+        Serial.println("We don't have the right service?");
+        client->disconnect();
+        continue;
       }
-      scan->clearResults();
-      delay(2000);
-    }
-    if (!connected_to_server) {
-      return;
-    } else {
-      // Wait for a sync point. We are doing a fast busy loop here to minimize latency.
-      while (true) {
-        if (have_new_value) {
-          uint32_t new_value_freshness = millis() - new_value_time;
-          // If we have a fresh value, we are done, otherwise discard and wait for the next sync point.
-          if (new_value_freshness < 20) {
-            break;
-          } else {
-            have_new_value = false;
-          }
-        }
-        delayMicroseconds(100);
+      BLERemoteCharacteristic* remote_characteristic = remote_service->getCharacteristic(CHARACTERISTIC_UUID);  //do we ever need to free this?
+      if (remote_characteristic == nullptr) {
+        Serial.println("We don't have the right characteristic?");
+        client->disconnect();
+        continue;
       }
-      have_new_value = false;
-      if (rng_state == 0) {
-        Serial.println("Remote glove says we are done. Shutting down.");
-        Shutdown();
+      if (!remote_characteristic->canRead() || !remote_characteristic->canNotify()) {
+        Serial.println("Wrong characteristic capabilities set on server");
+        client->disconnect();
+        continue;
       }
+      remote_characteristic->registerForNotify(ClientNotifyCallback);
+      connected_to_server = true;
+      Serial.printf("We are connected! Current seed: %u\n", remote_characteristic->readUInt32());
+      break;
     }
   }
+  scan->clearResults();
+  delay(2000);
+  return connected_to_server;
+}
 
+void ClientLoop() {
+  if (!EnsureConnectionToServer()) return;
+
+  // We are connected, wait for a sync point. We are doing a fast busy loop here to minimize latency.
+  while (true) {
+    if (have_new_value) {
+      uint32_t new_value_freshness = millis() - new_value_time;
+      // If we have a fresh value, we are done, otherwise discard and wait for the next sync point.
+      if (new_value_freshness < 20) {
+        break;
+      } else {
+        have_new_value = false;
+      }
+    }
+    delayMicroseconds(100);
+  }
+  have_new_value = false;
+  if (rng_state == 0) {
+    Serial.println("Remote glove says we are done. Shutting down.");
+    Shutdown();
+  }
+}
+
+void RunMotors() {
   uint8_t seq[NUM_CHANNELS];
   MakePermutatedSequence(seq, /*reversed=*/!is_ble_server);
   for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
@@ -343,4 +340,20 @@ void loop() {
     delay(66);
   }
   delay(666);
+}
+
+void loop() {
+  if (!BatteryOK()) {
+    Serial.printf("Low battery. Shutting down");
+    Shutdown();
+  }
+
+  if (millis() > (TOTAL_RUN_TIME_S * 1000)) {
+    Serial.println("We are done! Shutting down now");
+    Shutdown(false);
+  }
+
+  is_ble_server ? ServerLoop() : ClientLoop();
+
+  RunMotors();
 }
