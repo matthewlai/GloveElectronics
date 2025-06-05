@@ -171,7 +171,7 @@ static void ClientNotifyCallback(
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin();
   delay(500);
   pinMode(LED_PIN, OUTPUT);
   pinMode(DRV_EN_PIN, OUTPUT);
@@ -237,14 +237,14 @@ void Shutdown(bool with_flashing_leds = true) {
   esp_deep_sleep_start();
 }
 
+float vbatt = ReadVBatt();
 bool BatteryOK() {
   static int low_battery_iterations = 0;
-  float vbatt = ReadVBatt();
   if (vbatt >= LOW_BATT_THRESHOLD) { 
     low_battery_iterations = 0;
-    return false;
+    return true;
   }
-  return ++low_battery_iterations > 3;
+  return ++low_battery_iterations < 4;
 }
 
 void ServerLoop() {
@@ -344,7 +344,7 @@ void RunMotors() {
 
 void loop() {
   if (!BatteryOK()) {
-    Serial.printf("Low battery. Shutting down");
+    Serial.printf("Low battery (%fv). Shutting down\n", vbatt);
     Shutdown();
   }
 
