@@ -1,3 +1,5 @@
+// Select ESP32C3 Dev Module as the board, and enable "USB CDC On Boot" in the "Tools" menu.
+
 #include <algorithm>
 #include <utility>
 
@@ -11,31 +13,14 @@ constexpr int LED_PIN = 21;
 constexpr int SYNC_SERVER_CLIENT_SELECT_PIN = 5;  // high = server, low = client
 constexpr int PWM_PINS[4] = { 0, 1, 4, 3 };
 
-constexpr int TARGET_DRIVE_FREQUENCY = 250;  // 250 Hz according to Pfeifer et al. 2021
-
-// The chip expects a PWM signal where duty cycle 50 means stopped, and 255 is full speed in one phase, 0 full speed in the opposite phase.
-// Though for signal reasons we can't actually use 0% and 100%.
-// This should ideally be configurable at run time, we should figure out a UI (maybe a phone app?)
-constexpr uint16_t ACTIVE_DUTY_CYCLE = 250;
-
-constexpr float LOW_BATT_THRESHOLD = 3.2f;  // This is quite high, but lower than this and we start getting brown out resets at high power.
-
-const uint32_t TOTAL_RUN_TIME_S = 2 * 60 * 60;  // 2 hours.
-
-// Bluetooth Low Energy params.
-// These are our randomly generated unique Service and Characteristic UUIDs, so the gloves can recognise each other.
-constexpr char* SERVICE_UUID = "21014a2d-ebee-4fcb-b8d4-dcf34c19610a";
-
-// The server sends its PRNG state every cycle so clients can sync up with it.
-// 0 is a special value that means we are done.
-constexpr char* CHARACTERISTIC_UUID = "44f21c6b-b08b-4695-970f-f21a15b538db";
-
-constexpr int BLE_SCAN_TIME_S = 5;
+//**********************************************************************************
+// I2C device driver
 
 constexpr int DRV_EN_PIN = 10;
 constexpr int SDA_PIN = 8;
 constexpr int SCL_PIN = 2;
 constexpr uint16_t I2C_MUX_ADDR = 0x70;
+constexpr uint32_t I2C_CLOCK_FREQUENCY = 400000;
 constexpr uint16_t DRV2605_I2C_ADDR = 0x5A;
 constexpr uint8_t NUM_CHANNELS = 4;
 
@@ -44,6 +29,10 @@ constexpr uint8_t DRV2605_REG_FEEDBACK = 0x1A;
 constexpr uint8_t DRV2605_REG_CONTROL3 = 0x1D;
 constexpr uint8_t DRV2605_REG_VBATT = 0x21;
 
+void I2CBegin() {
+  Wire.begin(SDA_PIN, SCL_PIN, I2C_CLOCK_FREQUENCY);
+}
+
 void SetI2CChannel(uint8_t channel) {
   Wire.beginTransmission(I2C_MUX_ADDR);
   Wire.write(1 << channel);
@@ -51,14 +40,14 @@ void SetI2CChannel(uint8_t channel) {
 }
 
 void WriteDriverRegister(uint8_t reg_addr, uint8_t val) {
-  uint8_t buf[2] = {reg_addr, val};
+  uint8_t buf[2] = { reg_addr, val };
   Wire.beginTransmission(DRV2605_I2C_ADDR);
   Wire.write(buf, 2);
   Wire.endTransmission();
 }
 
 uint8_t ReadDriverRegister(uint8_t reg_addr) {
-  uint8_t buf[1] = {reg_addr};
+  uint8_t buf[1] = { reg_addr };
   Wire.beginTransmission(DRV2605_I2C_ADDR);
   Wire.write(buf, 1);
   Wire.endTransmission(/*stop=*/false);
@@ -68,19 +57,25 @@ uint8_t ReadDriverRegister(uint8_t reg_addr) {
   return buf[0];
 }
 
-void InitDriver(uint8_t channel) {
-  digitalWrite(DRV_EN_PIN, HIGH);
+//**********************************************************************************
+// Power management
 
-  SetI2CChannel(channel);
-  
-  // Wait 250 microseconds for the driver to be ready (datasheet page 53).
-  delayMicroseconds(250);
-
-  // This init sequence is adapted from the Adafruit DRV2605 library.
-  WriteDriverRegister(DRV2605_REG_MODE, 0x03);  // out of standby and into PWM input mode.
-
-  WriteDriverRegister(DRV2605_REG_FEEDBACK, ReadDriverRegister(DRV2605_REG_FEEDBACK) | 0x80);  // LRA mode.
-  WriteDriverRegister(DRV2605_REG_CONTROL3, ReadDriverRegister(DRV2605_REG_CONTROL3) | 0x01);  // LRA open loop mode.
+void Shutdown(bool with_flashing_leds = true) {
+  digitalWrite(DRV_EN_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  if (with_flashing_leds) {
+    for (int i = 0; i < 3; ++i) {
+      digitalWrite(LED_PIN, HIGH);
+      delay(300);
+      digitalWrite(LED_PIN, LOW);
+      delay(300);
+    }
+  } else {
+    delay(100);  // Wait for any potentially in-flight I2C transmissions to finish.
+  }
+  // Go into permanent deep sleep, which is the lowest power state we can access from
+  // firmware.
+  esp_deep_sleep_start();
 }
 
 float ReadVBatt() {
@@ -88,9 +83,24 @@ float ReadVBatt() {
   return static_cast<float>(ReadDriverRegister(DRV2605_REG_VBATT)) * 5.6f / 255.0f;
 }
 
+constexpr float LOW_BATT_THRESHOLD = 3.2f;  // This is quite high, but lower than this and we start getting brown out resets at high power.
+float vbatt = ReadVBatt();
+bool BatteryOK() {
+  static int low_battery_iterations = 0;
+  if (vbatt >= LOW_BATT_THRESHOLD) {
+    low_battery_iterations = 0;
+    return true;
+  }
+  return ++low_battery_iterations < 4;
+}
+
+//**********************************************************************************
+// Sequence control
+
 // For reproducible stimulation patterns (so we can give two hands the same pattern), we need
 // a PRNG that has a small state that can be shared. It doesn't need to be cryptographically secure.
 // We implement the linear congruential generator here, with C++11's minstd_rand params.
+constexpr uint32_t PRNG_SEED = 42;
 constexpr uint32_t LCG_M = (1UL << 31) - 1;
 constexpr uint32_t LCG_A = 48271;
 constexpr uint32_t LCG_C = 0;
@@ -122,6 +132,59 @@ void MakePermutatedSequence(uint8_t buf_out[NUM_CHANNELS], bool reversed) {
   }
 }
 
+//**********************************************************************************
+// Motor control
+
+constexpr int TARGET_DRIVE_FREQUENCY = 250;  // 250 Hz according to Pfeifer et al. 2021
+// The chip expects a PWM signal where duty cycle 50 means stopped, and 255 is full speed in one phase, 0 full speed in the opposite phase.
+// Though for signal reasons we can't actually use 0% and 100%.
+// This should ideally be configurable at run time, we should figure out a UI (maybe a phone app?)
+constexpr uint16_t ACTIVE_DUTY_CYCLE = 250;
+const uint32_t TOTAL_RUN_TIME_S = 2 * 60 * 60;  // 2 hours.
+
+// Bluetooth Low Energy params.
+// These are our randomly generated unique Service and Characteristic UUIDs, so the gloves can recognise each other.
+constexpr char* SERVICE_UUID = "21014a2d-ebee-4fcb-b8d4-dcf34c19610a";
+
+// The server sends its PRNG state every cycle so clients can sync up with it.
+// 0 is a special value that means we are done.
+constexpr char* CHARACTERISTIC_UUID = "44f21c6b-b08b-4695-970f-f21a15b538db";
+
+constexpr int BLE_SCAN_TIME_S = 5;
+
+void InitDriver(uint8_t channel) {
+  digitalWrite(DRV_EN_PIN, HIGH);
+
+  SetI2CChannel(channel);
+
+  // Wait 250 microseconds for the driver to be ready (datasheet page 53).
+  delayMicroseconds(250);
+
+  // This init sequence is adapted from the Adafruit DRV2605 library.
+  WriteDriverRegister(DRV2605_REG_MODE, 0x03);  // out of standby and into PWM input mode.
+
+  WriteDriverRegister(DRV2605_REG_FEEDBACK, ReadDriverRegister(DRV2605_REG_FEEDBACK) | 0x80);  // LRA mode.
+  WriteDriverRegister(DRV2605_REG_CONTROL3, ReadDriverRegister(DRV2605_REG_CONTROL3) | 0x01);  // LRA open loop mode.
+}
+
+void RunMotors(bool reversed) {
+  uint8_t seq[NUM_CHANNELS];
+  MakePermutatedSequence(seq, reversed);
+  for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+    ledcWrite(PWM_PINS[seq[ch]], ACTIVE_DUTY_CYCLE);
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    ledcWrite(PWM_PINS[seq[ch]], 128);
+    digitalWrite(LED_PIN, LOW);
+    delay(66);
+  }
+  delay(666);
+}
+
+
+//**********************************************************************************
+// Bluetooth
+
 bool is_ble_server = false;
 
 // For BLE server.
@@ -139,13 +202,13 @@ volatile uint32_t new_value_time = 0;
 BLEScan* scan = nullptr;
 BLEClient* client = nullptr;
 
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer*) {
-      device_connected = true;
-    };
-    void onDisconnect(BLEServer*) {
-      device_connected = false;
-    }
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer*) {
+    device_connected = true;
+  };
+  void onDisconnect(BLEServer*) {
+    device_connected = false;
+  }
 };
 
 class MyClientCallback : public BLEClientCallbacks {
@@ -160,8 +223,7 @@ static void ClientNotifyCallback(
   BLERemoteCharacteristic* remote_characteristic,
   uint8_t* data,
   size_t len,
-  bool is_notify
-) {
+  bool is_notify) {
   if (len != 4) {
     Serial.printf("Wrong data length: %u, expected 4", len);
     return;
@@ -171,84 +233,36 @@ static void ClientNotifyCallback(
   have_new_value = true;
 }
 
-void setup() {
-  Serial.begin();
-  delay(500);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(DRV_EN_PIN, OUTPUT);
-  pinMode(SYNC_SERVER_CLIENT_SELECT_PIN, INPUT_PULLUP);
-  Wire.begin(SDA_PIN, SCL_PIN, 400000);
+void StartBLEServer() {
+  Serial.println("Starting as BLE server");
+  BLEDevice::init("Vibrating Glove (Server)");
+  server = BLEDevice::createServer();
+  server->setCallbacks(new MyServerCallbacks());
+  service = server->createService(SERVICE_UUID);
+  characteristic = service->createCharacteristic(CHARACTERISTIC_UUID,
+                                                 BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  characteristic->setValue(rng_state);
+  service->start();
 
-  for (int i = 0; i < NUM_CHANNELS; ++i) {
-    pinMode(PWM_PINS[i], OUTPUT);
-
-    // PWM frequency is drive frequency * 128 (DRV2605 datasheet page 14).
-    ledcAttach(PWM_PINS[i], TARGET_DRIVE_FREQUENCY * 128, 8);
-    InitDriver(i);
-  }
-
-  is_ble_server = digitalRead(SYNC_SERVER_CLIENT_SELECT_PIN) == HIGH;
-  if (is_ble_server) {
-    Serial.println("Starting as BLE server");
-    BLEDevice::init("Vibrating Glove (Server)");
-    server = BLEDevice::createServer();
-    server->setCallbacks(new MyServerCallbacks());
-    service = server->createService(SERVICE_UUID);
-    characteristic = service->createCharacteristic(CHARACTERISTIC_UUID,
-                                                   BLECharacteristic::PROPERTY_READ |
-                                                   BLECharacteristic::PROPERTY_NOTIFY);
-    uint32_t initial_value = 42;
-    characteristic->setValue(initial_value);
-    service->start();
-
-    advertising = BLEDevice::getAdvertising();
-    advertising->addServiceUUID(SERVICE_UUID);
-    advertising->setScanResponse(true);
-    advertising->setMinPreferred(0x06);  // This is apparently required for iPhones? Do we care?
-    advertising->setMaxPreferred(0x12);
-    advertising->start();
-  } else {
-    Serial.println("Starting as BLE client");
-    BLEDevice::init("Vibrating Glove (Client)");
-    scan = BLEDevice::getScan();
-    scan->setActiveScan(true);
-    scan->setInterval(0x10);  // 10ms.
-    scan->setWindow(0x10);  // 10ms.
-    client = BLEDevice::createClient();
-  }
-
-  SeedPRNG(42);
+  advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);  // This is apparently required for iPhones? Do we care?
+  advertising->setMaxPreferred(0x12);
+  advertising->start();
 }
 
-void Shutdown(bool with_flashing_leds = true) {
-  digitalWrite(DRV_EN_PIN, LOW);
-  digitalWrite(LED_PIN, LOW);
-  if (with_flashing_leds) {
-    for (int i = 0; i < 3; ++i) {
-      digitalWrite(LED_PIN, HIGH);
-      delay(300);
-      digitalWrite(LED_PIN, LOW);
-      delay(300);
-    }
-  } else {
-    delay(100);  // Wait for any potentially in-flight I2C transmissions to finish.
-  } 
-  // Go into permanent deep sleep, which is the lowest power state we can access from
-  // firmware.
-  esp_deep_sleep_start();
+void StartBLEClient() {
+  Serial.println("Starting as BLE client");
+  BLEDevice::init("Vibrating Glove (Client)");
+  scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(0x10);  // 10ms.
+  scan->setWindow(0x10);    // 10ms.
+  client = BLEDevice::createClient();
 }
 
-float vbatt = ReadVBatt();
-bool BatteryOK() {
-  static int low_battery_iterations = 0;
-  if (vbatt >= LOW_BATT_THRESHOLD) { 
-    low_battery_iterations = 0;
-    return true;
-  }
-  return ++low_battery_iterations < 4;
-}
-
-void ServerLoop() {
+void BLEServerLoop() {
   if (device_connected && !last_device_connected) {
     // We have a new connection, and can stop advertising.
     advertising->stop();
@@ -264,7 +278,7 @@ void ServerLoop() {
   last_device_connected = device_connected;
 }
 
-bool EnsureConnectionToServer() {
+bool EnsureBLEConnectionToServer() {
   if (last_device_connected) return true;
 
   // The code below looks like it would leak memory like crazy...
@@ -278,7 +292,7 @@ bool EnsureConnectionToServer() {
       Serial.println("Found a device! Validating...");
       client->setClientCallbacks(new MyClientCallback());
       client->connect(&remote_device);
-      BLERemoteService* remote_service = client->getService(SERVICE_UUID); //do we ever need to free this?
+      BLERemoteService* remote_service = client->getService(SERVICE_UUID);  //do we ever need to free this?
       if (remote_service == nullptr) {
         Serial.println("We don't have the right service?");
         client->disconnect();
@@ -306,8 +320,8 @@ bool EnsureConnectionToServer() {
   return connected_to_server;
 }
 
-void ClientLoop() {
-  if (!EnsureConnectionToServer()) return;
+void BLEClientLoop() {
+  if (!EnsureBLEConnectionToServer()) return;
 
   // We are connected, wait for a sync point. We are doing a fast busy loop here to minimize latency.
   while (true) {
@@ -329,19 +343,32 @@ void ClientLoop() {
   }
 }
 
-void RunMotors() {
-  uint8_t seq[NUM_CHANNELS];
-  MakePermutatedSequence(seq, /*reversed=*/!is_ble_server);
-  for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
-    ledcWrite(PWM_PINS[seq[ch]], ACTIVE_DUTY_CYCLE);
-    digitalWrite(LED_PIN, HIGH);
-    delay(100);
-    ledcWrite(PWM_PINS[seq[ch]], 128);
-    digitalWrite(LED_PIN, LOW);
-    delay(66);
+
+//**********************************************************************************
+// Setup & Loop
+
+void setup() {
+  Serial.begin();
+  delay(500);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(DRV_EN_PIN, OUTPUT);
+  pinMode(SYNC_SERVER_CLIENT_SELECT_PIN, INPUT_PULLUP);
+  I2CBegin();
+
+  for (int i = 0; i < NUM_CHANNELS; ++i) {
+    pinMode(PWM_PINS[i], OUTPUT);
+
+    // PWM frequency is drive frequency * 128 (DRV2605 datasheet page 14).
+    ledcAttach(PWM_PINS[i], TARGET_DRIVE_FREQUENCY * 128, 8);
+    InitDriver(i);
   }
-  delay(666);
+
+  SeedPRNG(PRNG_SEED);
+
+  is_ble_server = digitalRead(SYNC_SERVER_CLIENT_SELECT_PIN) == HIGH;
+  is_ble_server ? StartBLEServer() : StartBLEClient();
 }
+
 
 void loop() {
   if (!BatteryOK()) {
@@ -354,7 +381,7 @@ void loop() {
     Shutdown(false);
   }
 
-  is_ble_server ? ServerLoop() : ClientLoop();
+  is_ble_server ? BLEServerLoop() : BLEClientLoop();
 
-  RunMotors();
+  RunMotors(!is_ble_server);
 }
