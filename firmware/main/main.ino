@@ -15,7 +15,8 @@ constexpr int TARGET_DRIVE_FREQUENCY = 250;  // 250 Hz according to Pfeifer et a
 
 // The chip expects a PWM signal where duty cycle 50 means stopped, and 255 is full speed in one phase, 0 full speed in the opposite phase.
 // Though for signal reasons we can't actually use 0% and 100%.
-constexpr uint16_t ACTIVE_DUTY_CYCLE = 140;
+// This should ideally be configurable at run time, we should figure out a UI (maybe a phone app?)
+constexpr uint16_t ACTIVE_DUTY_CYCLE = 250;
 
 constexpr float LOW_BATT_THRESHOLD = 3.2f;  // This is quite high, but lower than this and we start getting brown out resets at high power.
 
