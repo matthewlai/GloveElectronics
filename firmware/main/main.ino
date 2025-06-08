@@ -60,6 +60,8 @@ uint8_t ReadDriverRegister(uint8_t reg_addr) {
 //**********************************************************************************
 // Power management
 
+const uint32_t TOTAL_RUN_TIME_S = 2 * 60 * 60;  // 2 hours.
+
 void Shutdown(bool with_flashing_leds = true) {
   digitalWrite(DRV_EN_PIN, LOW);
   digitalWrite(LED_PIN, LOW);
@@ -96,61 +98,47 @@ bool BatteryOK() {
 
 //**********************************************************************************
 // Sequence control
+#define VIBRATION_PATTERN(a, b, c, d) ((uint8_t)(((a)&0x03) | (((b)&0x03) << 2) | (((c)&0x03) << 4) | (((d)&0x03) << 6)))
 
-// For reproducible stimulation patterns (so we can give two hands the same pattern), we need
-// a PRNG that has a small state that can be shared. It doesn't need to be cryptographically secure.
-// We implement the linear congruential generator here, with C++11's minstd_rand params.
-constexpr uint32_t PRNG_SEED = 42;
-constexpr uint32_t LCG_M = (1UL << 31) - 1;
-constexpr uint32_t LCG_A = 48271;
-constexpr uint32_t LCG_C = 0;
-uint32_t rng_state;
-
-void SeedPRNG(uint32_t seed) {
-  rng_state = seed;
-}
-
-uint32_t PRNG() {
-  rng_state = (LCG_A * rng_state + LCG_C) % LCG_M;
-  // We don't need a large range, and LCG has low period in low bits, so
-  // we throw away some low bits.
-  return rng_state >> 8;
-}
-
-void MakePermutatedSequence(uint8_t buf_out[NUM_CHANNELS], bool reversed) {
-  for (int i = 0; i < NUM_CHANNELS; ++i) {
-    buf_out[i] = i;
-  }
-  if (NUM_CHANNELS <= 1) {
-    return;
-  }
-  for (int i = 0; i < (NUM_CHANNELS - 1); ++i) {
-    std::swap(buf_out[i], buf_out[PRNG() % NUM_CHANNELS]);
-  }
-  if (reversed) {
-    std::reverse(buf_out, buf_out + NUM_CHANNELS);
-  }
-}
+// All possible sequences
+constexpr uint8_t vibration_patterns[] = {
+  VIBRATION_PATTERN(0, 1, 2, 3),
+  VIBRATION_PATTERN(0, 1, 3, 2),
+  VIBRATION_PATTERN(0, 2, 1, 3),
+  VIBRATION_PATTERN(0, 2, 3, 1),
+  VIBRATION_PATTERN(0, 3, 1, 2),
+  VIBRATION_PATTERN(0, 3, 2, 1),
+  VIBRATION_PATTERN(1, 0, 2, 3),
+  VIBRATION_PATTERN(1, 0, 3, 2),
+  VIBRATION_PATTERN(1, 2, 0, 3),
+  VIBRATION_PATTERN(1, 2, 3, 0),
+  VIBRATION_PATTERN(1, 3, 0, 2),
+  VIBRATION_PATTERN(1, 3, 2, 0),
+  VIBRATION_PATTERN(2, 0, 1, 3),
+  VIBRATION_PATTERN(2, 0, 3, 1),
+  VIBRATION_PATTERN(2, 1, 0, 3),
+  VIBRATION_PATTERN(2, 1, 3, 0),
+  VIBRATION_PATTERN(2, 3, 0, 1),
+  VIBRATION_PATTERN(2, 3, 1, 0),
+  VIBRATION_PATTERN(3, 0, 1, 2),
+  VIBRATION_PATTERN(3, 0, 2, 1),
+  VIBRATION_PATTERN(3, 1, 0, 2),
+  VIBRATION_PATTERN(3, 1, 2, 0),
+  VIBRATION_PATTERN(3, 2, 0, 1),
+  VIBRATION_PATTERN(3, 2, 1, 0),
+};
 
 //**********************************************************************************
 // Motor control
 
 constexpr int TARGET_DRIVE_FREQUENCY = 250;  // 250 Hz according to Pfeifer et al. 2021
+
 // The chip expects a PWM signal where duty cycle 50 means stopped, and 255 is full speed in one phase, 0 full speed in the opposite phase.
 // Though for signal reasons we can't actually use 0% and 100%.
 // This should ideally be configurable at run time, we should figure out a UI (maybe a phone app?)
 constexpr uint16_t ACTIVE_DUTY_CYCLE = 250;
-const uint32_t TOTAL_RUN_TIME_S = 2 * 60 * 60;  // 2 hours.
 
-// Bluetooth Low Energy params.
-// These are our randomly generated unique Service and Characteristic UUIDs, so the gloves can recognise each other.
-constexpr char* SERVICE_UUID = "21014a2d-ebee-4fcb-b8d4-dcf34c19610a";
-
-// The server sends its PRNG state every cycle so clients can sync up with it.
-// 0 is a special value that means we are done.
-constexpr char* CHARACTERISTIC_UUID = "44f21c6b-b08b-4695-970f-f21a15b538db";
-
-constexpr int BLE_SCAN_TIME_S = 5;
+volatile int current_pattern = -1;
 
 void InitDriver(uint8_t channel) {
   digitalWrite(DRV_EN_PIN, HIGH);
@@ -167,81 +155,68 @@ void InitDriver(uint8_t channel) {
   WriteDriverRegister(DRV2605_REG_CONTROL3, ReadDriverRegister(DRV2605_REG_CONTROL3) | 0x01);  // LRA open loop mode.
 }
 
-void RunMotors(bool reversed) {
-  uint8_t seq[NUM_CHANNELS];
-  MakePermutatedSequence(seq, reversed);
-  for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
-    ledcWrite(PWM_PINS[seq[ch]], ACTIVE_DUTY_CYCLE);
+void RunMotors(int pattern, bool mirrored) {
+  if (pattern < 0) return;
+
+  uint8_t seq = vibration_patterns[pattern];
+  if (mirrored) seq = ~seq;
+
+  Serial.printf("%010u Running sequence %02x\n", millis(), seq);
+  TickType_t last_wake_time = xTaskGetTickCount();
+
+  for (int ch = 0; ch < NUM_CHANNELS; ++ch, seq >>= 2) {
+    int finger = seq & 0x03;
+    ledcWrite(PWM_PINS[finger], ACTIVE_DUTY_CYCLE);
     digitalWrite(LED_PIN, HIGH);
-    delay(100);
-    ledcWrite(PWM_PINS[seq[ch]], 128);
+    vTaskDelayUntil(&last_wake_time, 100 / portTICK_PERIOD_MS);
+    ledcWrite(PWM_PINS[finger], 128);
     digitalWrite(LED_PIN, LOW);
-    delay(66);
+    vTaskDelayUntil(&last_wake_time, 66 / portTICK_PERIOD_MS);
   }
-  delay(666);
 }
 
 
 //**********************************************************************************
 // Bluetooth
 
-bool is_ble_server = false;
+// Bluetooth Low Energy params.
+// These are our randomly generated unique Service and Characteristic UUIDs, so the gloves can recognise each other.
+constexpr char* SERVICE_UUID = "21014a2d-ebee-4fcb-b8d4-dcf34c19610a";
+
+// The server sends its clock and pattern to execute to the client so they remain in sync.
+constexpr char* CHARACTERISTIC_UUID = "44f21c6b-b08b-4695-970f-f21a15b538db";
+
+constexpr int BLE_SCAN_TIME_S = 5;
 
 // For BLE server.
 BLEServer* server = nullptr;
 BLEService* service = nullptr;
 BLECharacteristic* characteristic = nullptr;
 BLEAdvertising* advertising = nullptr;
-bool last_device_connected = false;
+volatile bool last_device_connected = false;
 volatile bool device_connected = false;
+volatile TickType_t next_motor_cycle_start;
 
-// For BLE client.
-volatile bool connected_to_server = false;
-volatile bool have_new_value = false;
-volatile uint32_t new_value_time = 0;
-BLEScan* scan = nullptr;
-BLEClient* client = nullptr;
-
-class MyServerCallbacks : public BLEServerCallbacks {
+class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) {
     device_connected = true;
+    Serial.println("Client connected");
   };
   void onDisconnect(BLEServer*) {
     device_connected = false;
+    Serial.println("Client disconnected");
   }
 };
-
-class MyClientCallback : public BLEClientCallbacks {
-  void onConnect(BLEClient* pclient) {}
-
-  void onDisconnect(BLEClient* pclient) {
-    connected_to_server = false;
-  }
-};
-
-static void ClientNotifyCallback(
-  BLERemoteCharacteristic* remote_characteristic,
-  uint8_t* data,
-  size_t len,
-  bool is_notify) {
-  if (len != 4) {
-    Serial.printf("Wrong data length: %u, expected 4", len);
-    return;
-  }
-  memcpy(&rng_state, data, len);
-  new_value_time = millis();
-  have_new_value = true;
-}
 
 void StartBLEServer() {
-  Serial.println("Starting as BLE server");
   BLEDevice::init("Vibrating Glove (Server)");
   server = BLEDevice::createServer();
-  server->setCallbacks(new MyServerCallbacks());
+  server->setCallbacks(new ServerCallbacks());
   service = server->createService(SERVICE_UUID);
-  characteristic = service->createCharacteristic(CHARACTERISTIC_UUID,
-                                                 BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  characteristic->setValue(rng_state);
+  characteristic = service->createCharacteristic(
+    CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  uint32_t data[] = {xTaskGetTickCount(), next_motor_cycle_start, current_pattern};
+  characteristic->setValue((uint8_t *)data, sizeof(data));
   service->start();
 
   advertising = BLEDevice::getAdvertising();
@@ -250,16 +225,6 @@ void StartBLEServer() {
   advertising->setMinPreferred(0x06);  // This is apparently required for iPhones? Do we care?
   advertising->setMaxPreferred(0x12);
   advertising->start();
-}
-
-void StartBLEClient() {
-  Serial.println("Starting as BLE client");
-  BLEDevice::init("Vibrating Glove (Client)");
-  scan = BLEDevice::getScan();
-  scan->setActiveScan(true);
-  scan->setInterval(0x10);  // 10ms.
-  scan->setWindow(0x10);    // 10ms.
-  client = BLEDevice::createClient();
 }
 
 void BLEServerLoop() {
@@ -272,15 +237,58 @@ void BLEServerLoop() {
     advertising->start();
   }
   if (device_connected) {
-    characteristic->setValue(rng_state);
+    uint32_t data[] = {xTaskGetTickCount(), next_motor_cycle_start, current_pattern};
+    characteristic->setValue((uint8_t *)data, sizeof(data));
     characteristic->notify();
   }
   last_device_connected = device_connected;
 }
 
-bool EnsureBLEConnectionToServer() {
-  if (last_device_connected) return true;
+// For BLE client.
+volatile bool connected_to_server = false;
+volatile int32_t tick_drift;
+BLEScan* scan = nullptr;
+BLEClient* client = nullptr;
 
+class ClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+    Serial.println("Connected to server");
+  }
+
+  void onDisconnect(BLEClient* pclient) {
+    connected_to_server = false;
+    Serial.println("Disconnected from server");
+  }
+};
+
+static void ClientNotifyCallback(BLERemoteCharacteristic* rc, uint8_t* data, size_t len, bool is_notify) {
+  uint32_t value[3];
+  if (len != sizeof(value)) {
+    Serial.printf("Wrong data length: %u, expected %d", len, sizeof(value));
+    return;
+  }
+
+  memcpy(&value, data, len);
+  TickType_t server_ticks = value[0];
+  TickType_t next_cycle_start = value[1];
+  current_pattern = value[2];
+
+  TickType_t client_ticks = xTaskGetTickCount();
+  tick_drift = client_ticks - server_ticks;
+  next_motor_cycle_start = next_cycle_start + tick_drift; 
+  Serial.printf("%010u: New pattern starting at %010u(%u) %d\n", client_ticks, next_motor_cycle_start, tick_drift, current_pattern);
+}
+
+void StartBLEClient() {
+  BLEDevice::init("Vibrating Glove (Client)");
+  scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(0x10);  // 10ms.
+  scan->setWindow(0x10);    // 10ms.
+  client = BLEDevice::createClient();
+}
+
+bool BLEConnectToServer() {
   // The code below looks like it would leak memory like crazy...
   BLEScanResults* found_devices = scan->start(BLE_SCAN_TIME_S, false);
   Serial.print("Devices found: ");
@@ -290,7 +298,7 @@ bool EnsureBLEConnectionToServer() {
     BLEUUID service_uuid = remote_device.getServiceUUID();
     if (service_uuid.equals(BLEUUID(SERVICE_UUID))) {
       Serial.println("Found a device! Validating...");
-      client->setClientCallbacks(new MyClientCallback());
+      client->setClientCallbacks(new ClientCallbacks());
       client->connect(&remote_device);
       BLERemoteService* remote_service = client->getService(SERVICE_UUID);  //do we ever need to free this?
       if (remote_service == nullptr) {
@@ -311,41 +319,68 @@ bool EnsureBLEConnectionToServer() {
       }
       remote_characteristic->registerForNotify(ClientNotifyCallback);
       connected_to_server = true;
-      Serial.printf("We are connected! Current seed: %u\n", remote_characteristic->readUInt32());
       break;
     }
   }
   scan->clearResults();
-  delay(2000);
   return connected_to_server;
 }
 
 void BLEClientLoop() {
-  if (!EnsureBLEConnectionToServer()) return;
-
-  // We are connected, wait for a sync point. We are doing a fast busy loop here to minimize latency.
-  while (true) {
-    if (have_new_value) {
-      uint32_t new_value_freshness = millis() - new_value_time;
-      // If we have a fresh value, we are done, otherwise discard and wait for the next sync point.
-      if (new_value_freshness < 20) {
-        break;
-      } else {
-        have_new_value = false;
-      }
-    }
-    delayMicroseconds(100);
-  }
-  have_new_value = false;
-  if (rng_state == 0) {
-    Serial.println("Remote glove says we are done. Shutting down.");
-    Shutdown();
-  }
+  if (!(connected_to_server || BLEConnectToServer())) return;
 }
 
 
 //**********************************************************************************
 // Setup & Loop
+
+const TickType_t ble_update_frequency = 100 / portTICK_PERIOD_MS;
+
+void ble_server_task(void *parameter) {
+  TickType_t last_wake_time = xTaskGetTickCount();
+
+  StartBLEServer();
+  while (true) {
+    vTaskDelayUntil(&last_wake_time, ble_update_frequency);
+    BLEServerLoop();
+  }
+}
+
+void ble_client_task(void *parameter) {
+  StartBLEClient();
+  while (true) {
+    BLEClientLoop();
+    vTaskDelay(ble_update_frequency/2);
+  }
+}
+
+const TickType_t pattern_frequency = 1000 / portTICK_PERIOD_MS;
+
+void motor_server_task(void *parameter) {
+  TickType_t last_wake_time = xTaskGetTickCount();
+
+  while (true) {
+    int pattern = current_pattern = random(sizeof(vibration_patterns) / sizeof(vibration_patterns[0]));
+    next_motor_cycle_start = last_wake_time + pattern_frequency;
+    vTaskDelayUntil(&last_wake_time, pattern_frequency);
+    RunMotors(pattern, false);
+  }
+}
+
+void motor_client_task(void *parameter) {
+  while (next_motor_cycle_start <= xTaskGetTickCount() ) vTaskDelay(10 / portTICK_PERIOD_MS);
+
+  while (true) {
+    int gap = next_motor_cycle_start - xTaskGetTickCount();
+    if (gap > 0) vTaskDelay(gap);
+    int pattern = current_pattern;
+    RunMotors(pattern, true);
+  }
+}
+
+constexpr uint32_t TASK_STACK_SIZE = 10000;
+TaskHandle_t ble_task_handle;
+TaskHandle_t motor_task_handle;
 
 void setup() {
   Serial.begin();
@@ -363,13 +398,20 @@ void setup() {
     InitDriver(i);
   }
 
-  SeedPRNG(PRNG_SEED);
+  bool is_ble_server = digitalRead(SYNC_SERVER_CLIENT_SELECT_PIN) == HIGH;
 
-  is_ble_server = digitalRead(SYNC_SERVER_CLIENT_SELECT_PIN) == HIGH;
-  is_ble_server ? StartBLEServer() : StartBLEClient();
+  Serial.printf("Starting %s tasks: ", is_ble_server ? "server" : "client");
+  if (is_ble_server) {
+    xTaskCreate(motor_server_task, "Motor task", TASK_STACK_SIZE, NULL, 10, &motor_task_handle);
+    xTaskCreate(ble_server_task, "BLE task", TASK_STACK_SIZE, NULL, 10, &ble_task_handle);
+  } else {
+    xTaskCreate(motor_client_task, "Motor task", TASK_STACK_SIZE, NULL, 10, &motor_task_handle);
+    xTaskCreate(ble_client_task, "BLE task", TASK_STACK_SIZE, NULL, 10, &ble_task_handle);
+  }
+  Serial.println(motor_task_handle && ble_task_handle ? "SUCCESS" : "FAILURE");
 }
 
-
+// Low-priority housekeeping
 void loop() {
   if (!BatteryOK()) {
     Serial.printf("Low battery (%fv). Shutting down\n", vbatt);
@@ -380,8 +422,4 @@ void loop() {
     Serial.println("We are done! Shutting down now");
     Shutdown(false);
   }
-
-  is_ble_server ? BLEServerLoop() : BLEClientLoop();
-
-  RunMotors(!is_ble_server);
 }
