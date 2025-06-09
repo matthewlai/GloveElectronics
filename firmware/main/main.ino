@@ -84,9 +84,11 @@ float ReadVBatt() {
 }
 
 constexpr float LOW_BATT_THRESHOLD = 3.2f;  // This is quite high, but lower than this and we start getting brown out resets at high power.
-float vbatt = ReadVBatt();
+float vbatt;
+
 bool BatteryOK() {
   static int low_battery_iterations = 0;
+  vbatt = ReadVBatt();
   if (vbatt >= LOW_BATT_THRESHOLD) {
     low_battery_iterations = 0;
     return true;
@@ -211,7 +213,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-class MyClientCallback : public BLEClientCallbacks {
+class MyClientCallbacks : public BLEClientCallbacks {
   void onConnect(BLEClient* pclient) {}
 
   void onDisconnect(BLEClient* pclient) {
@@ -279,9 +281,12 @@ void BLEServerLoop() {
 }
 
 bool EnsureBLEConnectionToServer() {
-  if (last_device_connected) return true;
+  static MyClientCallbacks *client_callbacks = nullptr; 
 
-  // The code below looks like it would leak memory like crazy...
+  if (connected_to_server) return true;
+
+  if (!client_callbacks) client_callbacks = new MyClientCallbacks();
+
   BLEScanResults* found_devices = scan->start(BLE_SCAN_TIME_S, false);
   Serial.print("Devices found: ");
   Serial.println(found_devices->getCount());
@@ -290,7 +295,7 @@ bool EnsureBLEConnectionToServer() {
     BLEUUID service_uuid = remote_device.getServiceUUID();
     if (service_uuid.equals(BLEUUID(SERVICE_UUID))) {
       Serial.println("Found a device! Validating...");
-      client->setClientCallbacks(new MyClientCallback());
+      client->setClientCallbacks(client_callbacks);
       client->connect(&remote_device);
       BLERemoteService* remote_service = client->getService(SERVICE_UUID);  //do we ever need to free this?
       if (remote_service == nullptr) {
@@ -298,7 +303,7 @@ bool EnsureBLEConnectionToServer() {
         client->disconnect();
         continue;
       }
-      BLERemoteCharacteristic* remote_characteristic = remote_service->getCharacteristic(CHARACTERISTIC_UUID);  //do we ever need to free this?
+      BLERemoteCharacteristic* remote_characteristic = remote_service->getCharacteristic(CHARACTERISTIC_UUID);
       if (remote_characteristic == nullptr) {
         Serial.println("We don't have the right characteristic?");
         client->disconnect();
@@ -316,7 +321,6 @@ bool EnsureBLEConnectionToServer() {
     }
   }
   scan->clearResults();
-  delay(2000);
   return connected_to_server;
 }
 
