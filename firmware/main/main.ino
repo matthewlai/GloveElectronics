@@ -263,7 +263,9 @@ class ClientCallbacks : public BLEClientCallbacks {
 };
 
 static void ClientNotifyCallback(BLERemoteCharacteristic* rc, uint8_t* data, size_t len, bool is_notify) {
+  static TickType_t last_cycle_start_received = 0;
   uint32_t value[3];
+
   if (len != sizeof(value)) {
     Serial.printf("Wrong data length: %u, expected %d", len, sizeof(value));
     return;
@@ -276,8 +278,14 @@ static void ClientNotifyCallback(BLERemoteCharacteristic* rc, uint8_t* data, siz
 
   TickType_t client_ticks = xTaskGetTickCount();
   tick_drift = client_ticks - server_ticks;
-  next_motor_cycle_start = next_cycle_start + tick_drift; 
-  Serial.printf("%010u: New pattern starting at %010u(%u) %d\n", client_ticks, next_motor_cycle_start, tick_drift, current_pattern);
+  next_motor_cycle_start = next_cycle_start + tick_drift;
+  if (last_cycle_start_received != next_cycle_start) {
+    Serial.printf(
+      "%010u: New pattern starting at %010u(%u) %d(%02x/%02x)\n",
+      client_ticks, next_motor_cycle_start, tick_drift, current_pattern,
+      vibration_patterns[current_pattern], (uint8_t)~vibration_patterns[current_pattern]);
+    last_cycle_start_received = next_cycle_start;
+  }
 }
 
 void StartBLEClient() {
@@ -378,9 +386,13 @@ void motor_client_task(void *parameter) {
 
   while (true) {
     int gap = next_motor_cycle_start - xTaskGetTickCount();
+    TickType_t cycle_end = next_motor_cycle_start + pattern_frequency;
+
     if (gap > 0) vTaskDelay(gap);
     int pattern = current_pattern;
     RunMotors(pattern, true);
+    gap = cycle_end - xTaskGetTickCount();
+    if (gap > 0) vTaskDelay(gap);
   }
 }
 
