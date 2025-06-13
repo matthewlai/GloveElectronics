@@ -13,6 +13,17 @@ constexpr int LED_PIN = 21;
 constexpr int SYNC_SERVER_CLIENT_SELECT_PIN = 5;  // high = server, low = client
 constexpr int PWM_PINS[4] = { 0, 1, 4, 3 };
 
+// PIN 20 is an output on the client, and an input on the server.
+// If they are connected together (ideally through a 1kOhm resistor for safety),
+// the server can use the signal being output by the client to measure how synchronized
+// they are.
+constexpr int SYNC_PIN = 20;
+volatile uint32_t sync_time = 0;
+
+void IRAM_ATTR sync_isr() {
+  sync_time = millis();
+}
+
 //**********************************************************************************
 // I2C device driver
 
@@ -157,15 +168,18 @@ void InitDriver(uint8_t channel) {
   WriteDriverRegister(DRV2605_REG_CONTROL3, ReadDriverRegister(DRV2605_REG_CONTROL3) | 0x01);  // LRA open loop mode.
 }
 
-void RunMotors(int pattern, bool mirrored) {
+void RunMotors(int pattern, bool is_client) {
   if (pattern < 0) return;
+  TickType_t last_wake_time = xTaskGetTickCount();
+  uint32_t start_time = millis();
 
   uint8_t seq = vibration_patterns[pattern];
-  if (mirrored) seq = ~seq;
+  if (is_client) {
+    seq = ~seq;
+    digitalWrite(SYNC_PIN, HIGH);
+  }
 
   Serial.printf("%010u Running sequence %02x\n", millis(), seq);
-  TickType_t last_wake_time = xTaskGetTickCount();
-
   for (int ch = 0; ch < NUM_CHANNELS; ++ch, seq >>= 2) {
     int finger = seq & 0x03;
     ledcWrite(PWM_PINS[finger], ACTIVE_DUTY_CYCLE);
@@ -173,6 +187,15 @@ void RunMotors(int pattern, bool mirrored) {
     vTaskDelayUntil(&last_wake_time, 100 / portTICK_PERIOD_MS);
     ledcWrite(PWM_PINS[finger], 128);
     digitalWrite(LED_PIN, LOW);
+    // Doing the skew computation here assumes that the skew is < 100ms, which should be safe
+    if (ch == 0) {
+      if (is_client) {
+      	digitalWrite(SYNC_PIN, LOW);
+      } else if (sync_time != 0) {
+        uint32_t now = millis();
+        Serial.printf("%010u Skew %dms\n", now, start_time-sync_time);
+      }
+    }
     vTaskDelayUntil(&last_wake_time, 66 / portTICK_PERIOD_MS);
   }
 }
@@ -371,6 +394,9 @@ void ble_client_task(void *parameter) {
 const TickType_t pattern_frequency = 1000 / portTICK_PERIOD_MS;
 
 void motor_server_task(void *parameter) {
+  pinMode(SYNC_PIN, INPUT);
+  attachInterrupt(SYNC_PIN, sync_isr, RISING);
+
   TickType_t last_wake_time = xTaskGetTickCount();
 
   while (true) {
@@ -382,6 +408,9 @@ void motor_server_task(void *parameter) {
 }
 
 void motor_client_task(void *parameter) {
+  pinMode(SYNC_PIN, OUTPUT);
+  digitalWrite(SYNC_PIN, LOW);
+
   while (next_motor_cycle_start <= xTaskGetTickCount() ) vTaskDelay(10 / portTICK_PERIOD_MS);
 
   while (true) {
