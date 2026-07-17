@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "vyb_conn")(type "KiCad")(uri "${KIPRJMOD}/vyb_conn.pretty")(options "")(descr ""))
+)

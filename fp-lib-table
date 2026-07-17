@@ -3,4 +3,5 @@
   (lib (name "oled")(type "KiCad")(uri "${KIPRJMOD}/footprints/oled.pretty")(options "")(descr ""))
   (lib (name "battery_holders")(type "KiCad")(uri "${KIPRJMOD}/footprints/battery_holders.pretty")(options "")(descr ""))
   (lib (name "easyeda2kicad")(type "KiCad")(uri "${KIPRJMOD}/footprints/easyeda2kicad.pretty")(options "")(descr ""))
+  (lib (name "light_pipe")(type "KiCad")(uri "${KIPRJMOD}/footprints/light_pipe.pretty")(options "")(descr ""))
 )

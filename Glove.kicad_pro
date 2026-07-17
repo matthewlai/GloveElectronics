@@ -56,6 +56,11 @@
           "gap": 0.0,
           "via_gap": 0.0,
           "width": 0.0
+        },
+        {
+          "gap": 0.2,
+          "via_gap": 0.2,
+          "width": 0.1524
         }
       ],
       "drc_exclusions": [
@@ -77,18 +82,6 @@
         ],
         [
           "padstack|77100000|124460000|dfc50824-ebf2-4430-98af-c1c9ae91bde3|00000000-0000-0000-0000-000000000000",
-          ""
-        ],
-        [
-          "text_height|56875000|114650000|90eac657-72de-406e-b235-70bd368a9c00|00000000-0000-0000-0000-000000000000",
-          ""
-        ],
-        [
-          "track_dangling|90600000|110324000|fea25301-7f94-4a60-84d1-8332ca6d42d5|00000000-0000-0000-0000-000000000000",
-          ""
-        ],
-        [
-          "track_dangling|90600000|112124000|242047c5-0f0d-46d3-b499-2aaa167f4c0e|00000000-0000-0000-0000-000000000000",
           ""
         ]
       ],
@@ -140,6 +133,7 @@
         "solder_mask_bridge": "error",
         "starved_thermal": "error",
         "text_height": "warning",
+        "text_on_edge_cuts": "error",
         "text_thickness": "warning",
         "through_hole_pad_without_hole": "error",
         "too_many_vias": "error",
@@ -510,6 +504,7 @@
       "single_global_label": "ignore",
       "unannotated": "error",
       "unconnected_wire_endpoint": "warning",
+      "undefined_netclass": "error",
       "unit_value_mismatch": "error",
       "unresolved_variable": "error",
       "wire_dangling": "error"
@@ -542,6 +537,14 @@
         "via_diameter": 0.45,
         "via_drill": 0.3,
         "wire_width": 6
+      },
+      {
+        "diff_pair_gap": 0.2032,
+        "diff_pair_width": 0.1468,
+        "name": "USB",
+        "pcb_color": "rgba(0, 0, 0, 0.000)",
+        "priority": 0,
+        "schematic_color": "rgba(0, 0, 0, 0.000)"
       }
     ],
     "meta": {
@@ -549,7 +552,16 @@
     },
     "net_colors": null,
     "netclass_assignments": null,
-    "netclass_patterns": []
+    "netclass_patterns": [
+      {
+        "netclass": "USB",
+        "pattern": "/D+"
+      },
+      {
+        "netclass": "USB",
+        "pattern": "/D-"
+      }
+    ]
   },
   "pcbnew": {
     "last_paths": {
